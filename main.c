@@ -1,135 +1,147 @@
 #include <stdio.h> 
 #include <stdlib.h>
 #include <unistd.h>
-
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <stdint.h>
-#include <fcntl.h>
-#include <sys/ioctl.h>
-//#include <linux/input.h> // this does not compile
-#include <errno.h>
-// from <linux/input.h>
-struct input_event {
-	struct timeval time;
-	__u16 type;
-	__u16 code;
-	__s32 value;
-};
-#define EVIOCGVERSION		_IOR('E', 0x01, int)			/* get driver version */
-#define EVIOCGID		_IOR('E', 0x02, struct input_id)	/* get device ID */
-#define EVIOCGKEYCODE		_IOR('E', 0x04, int[2])			/* get keycode */
-#define EVIOCSKEYCODE		_IOW('E', 0x04, int[2])			/* set keycode */
-#define EVIOCGNAME(len)		_IOC(_IOC_READ, 'E', 0x06, len)		/* get device name */
-#define EVIOCGPHYS(len)		_IOC(_IOC_READ, 'E', 0x07, len)		/* get physical location */
-#define EVIOCGUNIQ(len)		_IOC(_IOC_READ, 'E', 0x08, len)		/* get unique identifier */
-#define EVIOCGKEY(len)		_IOC(_IOC_READ, 'E', 0x18, len)		/* get global keystate */
-#define EVIOCGLED(len)		_IOC(_IOC_READ, 'E', 0x19, len)		/* get all LEDs */
-#define EVIOCGSND(len)		_IOC(_IOC_READ, 'E', 0x1a, len)		/* get all sounds status */
-#define EVIOCGSW(len)		_IOC(_IOC_READ, 'E', 0x1b, len)		/* get all switch states */
-#define EVIOCGBIT(ev,len)	_IOC(_IOC_READ, 'E', 0x20 + ev, len)	/* get event bits */
-#define EVIOCGABS(abs)		_IOR('E', 0x40 + abs, struct input_absinfo)		/* get abs value/limits */
-#define EVIOCSABS(abs)		_IOW('E', 0xc0 + abs, struct input_absinfo)		/* set abs value/limits */
-#define EVIOCSFF		_IOC(_IOC_WRITE, 'E', 0x80, sizeof(struct ff_effect))	/* send a force effect to a force feedback device */
-#define EVIOCRMFF		_IOW('E', 0x81, int)			/* Erase a force effect */
-#define EVIOCGEFFECTS		_IOR('E', 0x84, int)			/* Report number of effects playable at the same time */
-#define EVIOCGRAB		_IOW('E', 0x90, int)			/* Grab/Release device */
-// end <linux/input.h>
+#include "linux_input.h"
+#include "linux_input_event_util.h"
 
 #define DEBUG 0
 
+#define VERSION 1
+
 #define ERROR_DATA_FORMAT 1
 #define ERROR_IO 2
+#define ERROR_UNSUPPORTED_VERSION 3
+#define ERROR_ARGUEMENT 4 
 
 #define DATA_TYPE_SLEEP 0
 #define DATA_TYPE_EVENT 1
-#define DATA_HANDLER_COUNT 2
+#define DATA_TYPE_EVENT_SYNC 2
+#define DATA_TYPE_EVENT_TOUCH_X 3
+#define DATA_TYPE_EVENT_TOUCH_Y 4
+#define DATA_HANDLER_COUNT 5
 
 #define SIZE_TIMEVAL 8
 #define SIZE_EVENT 8
 
-typedef struct Args {
-	char* path;
-	char* pathOut;
-} Args;
 
 typedef void (*DataHandler)(FILE*, int);
 
-void parseArgs(int argc, char* argv[], int fromIndex, Args *args);
-char *getOrDefault(char *argv[], int i, int argc, char *defaultValue);
-int openDeviceOrExit(char *path, int flags);
-FILE *openFileOrExit(char *path, char *mode);
-void writeInputEvents(char*, char*);
+static void parseArgs(int argc, char* argv[], int fromIndex);
+static int openDeviceOrExit(char *path, int flags);
+static FILE *openFileOrExit(char *path, char *mode);
+static void execute();
+static void scanInput();
+static void readFileHeader(FILE *fi);
+inline static int readInt(FILE*, char*);
+inline static int scaleX(int x);
+inline static int scaleY(int y);
 
-void handleDataTypeSleep(FILE*, int);
-void handleDataTypeEvent(FILE*, int);
+static void handleDataTypeSleep(FILE*, int);
+static void handleDataTypeEvent(FILE*, int);
+static void handleDataTypeEventSync(FILE*, int);
+static void handleDataTypeEventTouchX(FILE*, int);
+static void handleDataTypeEventTouchY(FILE*, int);
 
 static DataHandler dataHandlers[DATA_HANDLER_COUNT] = {
 	handleDataTypeSleep,
-	handleDataTypeEvent
+	handleDataTypeEvent,
+	handleDataTypeEventSync,
+	handleDataTypeEventTouchX,
+	handleDataTypeEventTouchY
 };
+static char *pathIn = "";
+static int deviceFd;
 static struct input_event event;
 static unsigned char buffer[SIZE_EVENT];
-
-
+static int recordWidth, recordHeight, currentWidth = 0, currentHeight = 0;
 
 
 int main(int argc, char *argv[])
 {
-    printf("Parsing args...\n");
-    Args args;
-    parseArgs(argc, argv, 1, &args);
-    printf("pathIn = %s, pathOut = %s\n", args.path, args.pathOut);
-    printf("writing input event...\n");
-    writeInputEvents(args.path, args.pathOut);;
-	printf("Complete!\n");
+    parseArgs(argc, argv, 1);
+    #if DEBUG
+    printf("pathIn = %s, deviceFd = %d, currentWidth: %d, currentHeight: %d\n", pathIn, deviceFd, currentWidth, currentWidth);
+    #endif
+    memset(&event, 0, sizeof(event));
+    if(strlen(pathIn) == 0){
+    	scanInput();
+    }else{
+	    execute();
+    }
     return 0;                       
 }
 
-void parseArgs(int argc, char* argv[], int fromIndex, Args *args){
+static void parseArgs(int argc, char* argv[], int fromIndex){
 	int i = fromIndex;
-	args->path = getOrDefault(argv, i++, argc, "/sdcard/input.autojs");
-	args->pathOut = getOrDefault(argv, i++, argc, "/dev/input/event1");
-}
-
-char *getOrDefault(char *argv[], int i, int argc, char *defaultValue){
-	if(i >= argc){
-		return defaultValue;
+	char *nameOrPath = NULL;
+	while(i < argc){
+		char *arg = argv[i++];
+		if(arg[0] != '-'){
+			pathIn = arg;
+			continue;
+		}
+		switch(arg[1]){
+			case 'w':
+				currentWidth = atoi(argv[i++]);
+				continue;
+			case 'h':
+				currentHeight = atoi(argv[i++]);
+				continue;
+			case 'd':
+				nameOrPath = argv[i++];
+				continue;
+			default:
+				fprintf(stderr, "unknown option: %s\n", arg);
+				exit(ERROR_ARGUEMENT);
+		}
 	}
-	return argv[i];
+	if(nameOrPath == NULL){
+		fprintf(stderr, "option -d should be set\n");
+		exit(ERROR_ARGUEMENT);
+	}
+	if(nameOrPath[0] != '/'){
+		#if DEBUG
+		printf("open_device_by_name: %s\n", nameOrPath);
+		#endif
+		deviceFd = open_device_by_name("/dev/input", nameOrPath);
+	}else{
+		deviceFd = openDeviceOrExit(nameOrPath, O_RDWR);
+	}
+	if(deviceFd < 0){
+		fprintf(stderr, "cannot open device: %s\n", nameOrPath);
+		exit(ERROR_IO);
+	}
 }
 
-int openDeviceOrExit(char *path, int flags){
+static int openDeviceOrExit(char *path, int flags){
 	int f = open(path, flags);
 	if(f < 0){
-		printf("Error open '%s' with flags '%d'\n", path, flags);
+		fprintf(stderr, "Error open '%s' with flags %x\n", path, flags);
 		exit(ERROR_IO);
 	}
 	return f;
 }
 
-
-FILE *openFileOrExit(char *path, char *mode){
+static FILE *openFileOrExit(char *path, char *mode){
 	FILE *f = fopen(path, mode);
 	if(f == NULL){
-		printf("Error open '%s' with mode '%s\n", path, mode);
+		fprintf(stderr, "Error open '%s' with mode '%s\n", path, mode);
 		exit(ERROR_IO);
 	}
 	return f;
 }
 
-void writeInputEvents(char *pathIn, char *pathOut){
-    memset(&event, 0, sizeof(event));
+static void execute(){
 	FILE *fi = openFileOrExit(pathIn, "rb");
-	int fo = openDeviceOrExit(pathOut, O_RDWR);
+	readFileHeader(fi);
+	int fo = deviceFd;
 	while(1){
 		unsigned char dataType = fgetc(fi);
 		if(feof(fi)){
 			break;
 		}
 		if(dataType >= DATA_HANDLER_COUNT){
-			printf("Error: unknown data type: %u\n", dataType);
+			fprintf(stderr, "Error: unknown data type: %u\n", dataType);
 			exit(ERROR_DATA_FORMAT);
 		}
 		#if DEBUG
@@ -142,31 +154,128 @@ void writeInputEvents(char *pathIn, char *pathOut){
 }
 
 
-void handleDataTypeSleep(FILE *fi, int fo){
-	if(fread(buffer, 4, 1, fi) != 1){
-		printf("handleDataTypeSleep: Format error.\n");
+static void readFileHeader(FILE *fi){
+	if(readInt(fi, "FileHeader") != 0x00B87B6D){
+		fprintf(stderr, "FileHeader Format error.\n");
 		exit(ERROR_DATA_FORMAT);
 	}
-	int n = buffer[3] | (buffer[2] << 8) | (buffer[1] << 16) | (buffer[0] << 24);
+	int v = readInt(fi, "Version");
 	#if DEBUG
-	printf("sleep(%d) %x\n", n, n);
+	printf(".auto file version: %d\n", v);
+	#endif
+	if(v > VERSION){
+		fprintf(stderr, "Only support .auto file version <= %d\n", VERSION);
+		exit(ERROR_UNSUPPORTED_VERSION);
+	}
+	recordWidth = readInt(fi, "recordWidth");
+	recordHeight = readInt(fi, "recordHeight");
+	#if DEBUG
+	printf("recordWidth: %d, recordHeight: %d\n", recordWidth, recordHeight);
+	#endif
+	fseek(fi, 240, SEEK_CUR);
+}
+
+
+static inline writeEvent(){
+	if(write(deviceFd, &event, sizeof(event)) != sizeof(event)){
+		fprintf(stderr, "Error write event.\n");
+		exit(ERROR_IO);
+	}
+}
+
+static void handleDataTypeSleep(FILE *fi, int fo){
+	int n = readInt(fi, "handleDataTypeSleep");
+	#if DEBUG
+	printf("sleep(%d)\n", n);
 	#endif
 	usleep(n * 1000L);
 }
 
-void handleDataTypeEvent(FILE *fi, int fo){
+static void handleDataTypeEvent(FILE *fi, int fo){
 	if(fread(buffer, SIZE_EVENT, 1, fi) != 1){
-		printf("handleDataTypeEvent: Format error.\n");
+		fprintf(stderr, "handleDataTypeEvent: Format error.\n");
 		exit(ERROR_DATA_FORMAT);
 	}
 	event.type = buffer[1] | (buffer[0] << 8);
 	event.code = buffer[3] | (buffer[2] << 8);
 	event.value = buffer[7] | (buffer[6] << 8) | (buffer[5] << 16) | (buffer[4] << 24);
+	if(event.type == 3){
+		if(event.code == 0x35){
+			event.value = scaleX(event.value);
+		}else if(event.code == 0x36){
+			event.value = scaleY(event.value);
+		}
+	}
 	#if DEBUG
 	printf("handleDataTypeEvent: type=%d code=%d value=%d\n", event.type, event.code, event.value);
 	#endif
-	if(write(fo, &event, sizeof(event)) != sizeof(event)){
-		printf("handleDataTypeEvent: Write error.\n");
-		exit(ERROR_IO);
+	writeEvent();
+}
+
+static void handleDataTypeEventSync(FILE *fi, int fo){
+	#if DEBUG
+	printf("write sync report\n");
+	#endif
+	event.type = 0;
+	event.code = 0;
+	event.value = 0;
+	writeEvent();
+}
+
+static void handleDataTypeEventTouchX(FILE *fi, int fo){
+	event.type = 3;
+	event.code = 0x35;
+	event.value = scaleX(readInt(fi, "Read touch x"));
+	#if DEBUG
+	printf("write touch x: %d\n", event.value);
+	#endif
+	writeEvent();
+}
+
+static void handleDataTypeEventTouchY(FILE *fi, int fo){
+	event.type = 3;
+	event.code = 0x36;
+	event.value = scaleY(readInt(fi, "Read touch y"));
+	#if DEBUG
+	printf("write touch y: %d\n", event.value);
+	#endif
+	writeEvent();
+}
+
+inline static int readInt(FILE *fi, char *msg){
+	if(fread(buffer, 4, 1, fi) != 1){
+		fprintf(stderr, "%s: Format error.\n", msg);
+		exit(ERROR_DATA_FORMAT);
+	}
+	return buffer[3] | (buffer[2] << 8) | (buffer[1] << 16) | (buffer[0] << 24);
+}
+
+inline static int scaleX(int x){
+	if(currentWidth == 0 || currentWidth == recordWidth){
+		return x;
+	}
+	return x * currentWidth / recordWidth;
+}
+
+inline static int scaleY(int y){
+	if(currentHeight == 0 || currentHeight == recordHeight){
+		return y;
+	}
+	return y * currentHeight / recordWidth;
+}
+
+static void scanInput(){
+	while(1){
+		if(scanf("%hu %hu %d", &event.type, &event.code, &event.value) != 3){
+			fprintf(stderr, "Data format error.\n");
+			exit(ERROR_DATA_FORMAT);
+		}
+		if(event.type == 0xffff && event.code == 0xffff && event.value == 0xefefefef){
+			exit(0);
+		}
+		if(write(deviceFd, &event, sizeof(event)) != sizeof(event)){
+			fprintf(stderr, "Error write event.\n");
+			exit(ERROR_IO);
+		}
 	}
 }

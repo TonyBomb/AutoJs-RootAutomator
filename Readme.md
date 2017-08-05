@@ -29,7 +29,7 @@ chmod 777 /data/local/tmp/root_automator
 程序会按照以下步骤解析输入文件：
 1. 读取一个字节(data_type)。根据data_type的值：
 	* 0x00 读取后面4个字节作为一个int值(n)。暂停执行n毫秒的时间。
-	* 0x01 读取后面8个字节构造一个input_event(参见[linux/input.h](https://github.com/torvalds/linux/blob/master/include/uapi/linux/input.h))。把他写入到out_device_path设备中。其中input_event的时间戳time会被置为0，type取自0~1字节，code取自2~3字节，value取自4~7字节)
+	* 0x01 读取后面8个字节构造一个input_event(参见[linux/input.h](https://github.com/torvalds/linux/blob/master/include/uapi/linux/input.h))。把他写入到out_device_path设备中。其中input_event的时间戳time会被置为0，type取自0\~1字节，code取自2\~3字节，value取自4\~7字节)
 2. 如果到达文件末尾，结束程序；否则执行步骤1。
 
 ### 更多

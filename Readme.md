@@ -13,7 +13,7 @@
 把bin目录下的可执行文件root_automator复制或者adb push到有可执行权限的目录(例如/data/local/tmp，以下以此目录为例)，用shell命令执行
 ```
 chmod 777 /data/local/tmp/root_automator
-/data/local/tmp/root_automator -d out_devive_path \[-w currentDeviceWidth -h currentDeviceHeight\] in_file_path
+/data/local/tmp/root_automator -d out_devive_path [-w currentDeviceWidth -h currentDeviceHeight] in_file_path
 ```
 其中root_automator的参数意义如下：
 * in_file_path 一个描述触摸事件以及事件之间的延迟的特定格式的文件，参见[输入文件格式](#输入文件格式)。

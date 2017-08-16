@@ -1,6 +1,9 @@
 #include <stdio.h> 
 #include <stdlib.h>
 #include <unistd.h>
+#include <pthread.h>  
+#include <sys/wait.h>  
+#include <sys/types.h> 
 #include "linux_input.h"
 #include "linux_input_event_util.h"
 
@@ -12,6 +15,7 @@
 #define ERROR_IO 2
 #define ERROR_UNSUPPORTED_VERSION 3
 #define ERROR_ARGUEMENT 4 
+#define ERROR_INTR 5
 
 #define DATA_TYPE_SLEEP 0
 #define DATA_TYPE_EVENT 1
@@ -27,12 +31,14 @@
 typedef void (*DataHandler)(FILE*, int);
 
 static void parseArgs(int argc, char* argv[], int fromIndex);
-static int openDeviceOrExit(char *path, int flags);
-static FILE *openFileOrExit(char *path, char *mode);
-static void execute();
 static void scanInput();
 static void readFileHeader(FILE *fi);
+static void execute();
+
 inline static int readInt(FILE*, char*);
+static int openDeviceOrExit(char *path, int flags);
+static FILE *openFileOrExit(char *path, char *mode);
+
 inline static int scaleX(int x);
 inline static int scaleY(int y);
 
@@ -41,6 +47,9 @@ static void handleDataTypeEvent(FILE*, int);
 static void handleDataTypeEventSync(FILE*, int);
 static void handleDataTypeEventTouchX(FILE*, int);
 static void handleDataTypeEventTouchY(FILE*, int);
+
+static void handleSignalInt();
+static void __exit(int i);
 
 static DataHandler dataHandlers[DATA_HANDLER_COUNT] = {
 	handleDataTypeSleep,
@@ -58,6 +67,7 @@ static int recordWidth, recordHeight, currentWidth = 0, currentHeight = 0;
 
 int main(int argc, char *argv[])
 {
+	signal(SIGINT, handleSignalInt);   
     parseArgs(argc, argv, 1);
     #if DEBUG
     printf("pathIn = %s, deviceFd = %d, currentWidth: %d, currentHeight: %d\n", pathIn, deviceFd, currentWidth, currentWidth);
@@ -68,6 +78,7 @@ int main(int argc, char *argv[])
     }else{
 	    execute();
     }
+    printf("Finish!\n");
     return 0;                       
 }
 
@@ -92,12 +103,12 @@ static void parseArgs(int argc, char* argv[], int fromIndex){
 				continue;
 			default:
 				fprintf(stderr, "unknown option: %s\n", arg);
-				exit(ERROR_ARGUEMENT);
+				__exit(ERROR_ARGUEMENT);
 		}
 	}
 	if(nameOrPath == NULL){
 		fprintf(stderr, "option -d should be set\n");
-		exit(ERROR_ARGUEMENT);
+		__exit(ERROR_ARGUEMENT);
 	}
 	if(nameOrPath[0] != '/'){
 		#if DEBUG
@@ -109,7 +120,7 @@ static void parseArgs(int argc, char* argv[], int fromIndex){
 	}
 	if(deviceFd < 0){
 		fprintf(stderr, "cannot open device: %s\n", nameOrPath);
-		exit(ERROR_IO);
+		__exit(ERROR_IO);
 	}
 }
 
@@ -117,7 +128,7 @@ static int openDeviceOrExit(char *path, int flags){
 	int f = open(path, flags);
 	if(f < 0){
 		fprintf(stderr, "Error open '%s' with flags %x\n", path, flags);
-		exit(ERROR_IO);
+		__exit(ERROR_IO);
 	}
 	return f;
 }
@@ -126,7 +137,7 @@ static FILE *openFileOrExit(char *path, char *mode){
 	FILE *f = fopen(path, mode);
 	if(f == NULL){
 		fprintf(stderr, "Error open '%s' with mode '%s\n", path, mode);
-		exit(ERROR_IO);
+		__exit(ERROR_IO);
 	}
 	return f;
 }
@@ -142,7 +153,7 @@ static void execute(){
 		}
 		if(dataType >= DATA_HANDLER_COUNT){
 			fprintf(stderr, "Error: unknown data type: %u\n", dataType);
-			exit(ERROR_DATA_FORMAT);
+			__exit(ERROR_DATA_FORMAT);
 		}
 		#if DEBUG
 		printf("handle dataType: %d\n", dataType);
@@ -157,7 +168,7 @@ static void execute(){
 static void readFileHeader(FILE *fi){
 	if(readInt(fi, "FileHeader") != 0x00B87B6D){
 		fprintf(stderr, "FileHeader Format error.\n");
-		exit(ERROR_DATA_FORMAT);
+		__exit(ERROR_DATA_FORMAT);
 	}
 	int v = readInt(fi, "Version");
 	#if DEBUG
@@ -165,7 +176,7 @@ static void readFileHeader(FILE *fi){
 	#endif
 	if(v > VERSION){
 		fprintf(stderr, "Only support .auto file version <= %d\n", VERSION);
-		exit(ERROR_UNSUPPORTED_VERSION);
+		__exit(ERROR_UNSUPPORTED_VERSION);
 	}
 	recordWidth = readInt(fi, "recordWidth");
 	recordHeight = readInt(fi, "recordHeight");
@@ -179,7 +190,7 @@ static void readFileHeader(FILE *fi){
 static inline writeEvent(){
 	if(write(deviceFd, &event, sizeof(event)) != sizeof(event)){
 		fprintf(stderr, "Error write event.\n");
-		exit(ERROR_IO);
+		__exit(ERROR_IO);
 	}
 }
 
@@ -194,7 +205,7 @@ static void handleDataTypeSleep(FILE *fi, int fo){
 static void handleDataTypeEvent(FILE *fi, int fo){
 	if(fread(buffer, SIZE_EVENT, 1, fi) != 1){
 		fprintf(stderr, "handleDataTypeEvent: Format error.\n");
-		exit(ERROR_DATA_FORMAT);
+		__exit(ERROR_DATA_FORMAT);
 	}
 	event.type = buffer[1] | (buffer[0] << 8);
 	event.code = buffer[3] | (buffer[2] << 8);
@@ -245,7 +256,7 @@ static void handleDataTypeEventTouchY(FILE *fi, int fo){
 inline static int readInt(FILE *fi, char *msg){
 	if(fread(buffer, 4, 1, fi) != 1){
 		fprintf(stderr, "%s: Format error.\n", msg);
-		exit(ERROR_DATA_FORMAT);
+		__exit(ERROR_DATA_FORMAT);
 	}
 	return buffer[3] | (buffer[2] << 8) | (buffer[1] << 16) | (buffer[0] << 24);
 }
@@ -268,14 +279,27 @@ static void scanInput(){
 	while(1){
 		if(scanf("%hu %hu %d", &event.type, &event.code, &event.value) != 3){
 			fprintf(stderr, "Data format error.\n");
-			exit(ERROR_DATA_FORMAT);
+			__exit(ERROR_DATA_FORMAT);
 		}
 		if(event.type == 0xffff && event.code == 0xffff && event.value == 0xefefefef){
-			exit(0);
+			__exit(0);
 		}
 		if(write(deviceFd, &event, sizeof(event)) != sizeof(event)){
 			fprintf(stderr, "Error write event.\n");
-			exit(ERROR_IO);
+			__exit(ERROR_IO);
 		}
 	}
+}
+
+static void __exit(int i){
+	printf("Exit code: %d\n", i);
+	printf("Error!\n");
+	exit(i);
+}
+
+static void handleSignalInt(int sig){
+	if(deviceFd >= 0){
+		close(deviceFd);
+	}
+	__exit(ERROR_INTR);
 }
